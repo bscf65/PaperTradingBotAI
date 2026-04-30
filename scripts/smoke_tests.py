@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 BOT_PATH = ROOT / "bots/crypto/btc_bot_v13_package/btc_eth_sol_coinbase_paper_bot_v13.py"
 ANALYZER_PATH = ROOT / "bots/crypto/btc_bot_v13_package/analyze_bot_performance_v13.py"
+BACKTEST_PATH = ROOT / "bots/crypto/btc_bot_v13_package/backtest_walk_forward_v13.py"
 
 
 def load_module(path: Path, name: str):
@@ -18,6 +20,7 @@ def load_module(path: Path, name: str):
     if spec is None or spec.loader is None:
         raise AssertionError(f"could not load module spec for {path}")
     module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -64,11 +67,54 @@ def test_analyzer_minimal_logs() -> None:
         assert analyzer.analyze(log_dir) == 0
 
 
+def test_walk_forward_backtest() -> None:
+    backtest = load_module(BACKTEST_PATH, "backtest_smoke")
+    rows = []
+    price = 100.0
+    for i in range(180):
+        price *= 1.0005 + (0.001 if i % 17 == 0 else 0.0) - (0.0008 if i % 29 == 0 else 0.0)
+        rows.append(
+            {
+                "time": f"2026-01-01T00:{i % 60:02d}:00Z" if i < 60 else f"2026-01-01T{i // 60:02d}:{i % 60:02d}:00Z",
+                "Open": price * 0.999,
+                "High": price * 1.003,
+                "Low": price * 0.997,
+                "Close": price,
+                "Volume": 1000 + i,
+            }
+        )
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        csv_path = tmp_path / "synthetic_candles.csv"
+        pd = __import__("pandas")
+        pd.DataFrame(rows).to_csv(csv_path, index=False)
+        df = backtest.load_candles(csv_path)
+        args = backtest.argparse.Namespace(
+            paper_cash=1000.0,
+            trade_size=100.0,
+            fee_rate=0.006,
+            slippage_bps=5.0,
+            synthetic_spread_pct=0.001,
+            missed_fill_rate=0.0,
+            estimated_short_term_tax_rate=0.22,
+            estimated_state_tax_rate=0.093,
+            train_bars=80,
+            test_bars=30,
+            step_bars=30,
+            min_train_trades=0,
+        )
+        results, promotions = backtest.walk_forward(df, args, "BTC-USD")
+        assert not results.empty
+        assert not promotions.empty
+        assert "decision" in promotions.columns
+
+
 def main() -> int:
     test_shell_syntax()
     test_paper_only_source()
     test_log_dir_env_override_and_config()
     test_analyzer_minimal_logs()
+    test_walk_forward_backtest()
     print("Smoke tests passed.")
     return 0
 
