@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
@@ -338,6 +339,40 @@ def spread_pct(bid: float, ask: float, fallback_price: float) -> float:
     return 0.001  # fallback estimate
 
 
+def slippage_rate(args: argparse.Namespace) -> float:
+    return max(0.0, safe_float(getattr(args, "slippage_bps", 5.0), 5.0) / 10_000.0)
+
+
+def apply_slippage(price: float, side: str, args: argparse.Namespace) -> float:
+    rate = slippage_rate(args)
+    if side.upper() == "BUY":
+        return price * (1 + rate)
+    if side.upper() == "SELL":
+        return price * (1 - rate)
+    return price
+
+
+def missed_fill_probability(snap: dict[str, Any], args: argparse.Namespace) -> float:
+    base = normalize_rate(getattr(args, "missed_fill_rate", 0.02))
+    spread_component = min(0.08, max(0.0, safe_float(snap.get("spread_pct", 0.0), 0.0)) * 4)
+    volatility_component = 0.03 if snap.get("volatility_regime") in {"high", "extreme"} else 0.0
+    return max(0.0, min(0.50, base + spread_component + volatility_component))
+
+
+def paper_fill_missed(product: str, side: str, snap: dict[str, Any], args: argparse.Namespace) -> bool:
+    probability = missed_fill_probability(snap, args)
+    if probability <= 0:
+        return False
+
+    # Deterministic per minute/product/side so smoke tests and reruns are stable
+    # while still modeling that not every paper signal receives a fill.
+    minute_key = now_iso()[:16]
+    key = f"{minute_key}|{product}|{side}|{safe_float(snap.get('price', 0.0), 0.0):.2f}"
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    sample = int(digest[:8], 16) / 0xFFFFFFFF
+    return sample < probability
+
+
 def build_market_snapshot(product_id: str, granularity: int) -> dict[str, Any]:
     df = add_indicators(fetch_coinbase_candles(product_id, granularity))
     latest = df.iloc[-1]
@@ -621,7 +656,7 @@ def net_profit_pct_for_position(pos: dict[str, Any], bid: float, fee_rate: float
     return (proceeds_net - cost_basis) / cost_basis
 
 
-def open_position_accounting(pos: dict[str, Any], snap: dict[str, Any], fee_rate: float) -> dict[str, float]:
+def open_position_accounting(pos: dict[str, Any], snap: dict[str, Any], fee_rate: float, slippage_bps: float = 0.0) -> dict[str, float]:
     """Detailed open-position accounting for display and CSV logs.
 
     The goal is to separate market movement from fee/spread drag:
@@ -636,13 +671,14 @@ def open_position_accounting(pos: dict[str, Any], snap: dict[str, Any], fee_rate
     qty = safe_float(pos.get("qty", 0.0), 0.0)
     price = safe_float(snap.get("price", 0.0), 0.0)
     bid = safe_float(snap.get("bid", price), price)
+    exit_price = max(0.0, bid * (1 - max(0.0, slippage_bps) / 10_000.0))
     cost_basis = safe_float(pos.get("cost_basis", 0.0), 0.0)
     entry_fee = safe_float(pos.get("entry_fee_usd", 0.0), 0.0)
     entry_gross = safe_float(pos.get("entry_gross_spend_usd", cost_basis), cost_basis)
     token_cost_ex_fee = max(0.0, entry_gross - entry_fee)
 
     mark_value = qty * price
-    bid_value = qty * bid
+    bid_value = qty * exit_price
     estimated_exit_fee = max(0.0, bid_value * fee_rate)
     net_liquidation_value = bid_value - estimated_exit_fee
 
@@ -659,6 +695,7 @@ def open_position_accounting(pos: dict[str, Any], snap: dict[str, Any], fee_rate
         "token_cost_ex_fee_usd": token_cost_ex_fee,
         "mark_value_usd": mark_value,
         "bid_value_usd": bid_value,
+        "estimated_exit_price_usd": exit_price,
         "market_move_pl_usd": market_move_pl,
         "open_pl_after_entry_fee_usd": open_pl_after_entry_fee,
         "estimated_exit_fee_usd": estimated_exit_fee,
@@ -913,7 +950,7 @@ def estimated_tax_values(gain_loss_usd: float, term: str, args: argparse.Namespa
     }
 
 
-def buy_position(product: str, state: dict[str, Any], snap: dict[str, Any], trade_size: float, fee_rate: float) -> dict[str, Any] | None:
+def buy_position(product: str, state: dict[str, Any], snap: dict[str, Any], trade_size: float, args: argparse.Namespace, fee_rate: float) -> dict[str, Any] | None:
     pos = state["positions"][product]
     if safe_float(pos.get("qty", 0.0), 0.0) > 0:
         return None
@@ -924,9 +961,10 @@ def buy_position(product: str, state: dict[str, Any], snap: dict[str, Any], trad
         return None
 
     ask = safe_float(snap.get("ask"), snap["price"])
+    exec_price = apply_slippage(ask, "BUY", args)
     fee = gross_spend * fee_rate
     net_spend = gross_spend - fee
-    qty = net_spend / ask
+    qty = net_spend / exec_price
     if qty <= 0:
         return None
 
@@ -963,14 +1001,14 @@ def buy_position(product: str, state: dict[str, Any], snap: dict[str, Any], trad
         "side": "BUY",
         "qty": qty8(qty),
         "market_price": usd(snap["price"]),
-        "exec_price": usd(ask),
+        "exec_price": usd(exec_price),
         "fee_usd": usd(fee),
         "trade_cost_usd": usd(fee),
         "total_trade_cost_usd": usd(fee),
         "cash_after": usd(state["cash"]),
         "realized_pl_usd": 0.0,
         "trade_score": round(snap["trade_score"], 2),
-        "reason": "paper_buy_score_threshold",
+        "reason": f"paper_buy_score_threshold slippage_bps={safe_float(getattr(args, 'slippage_bps', 0.0), 0.0):.2f}",
     }
 
 
@@ -981,7 +1019,8 @@ def sell_position(product: str, state: dict[str, Any], snap: dict[str, Any], arg
         return None, None
 
     bid = safe_float(snap.get("bid"), snap["price"])
-    proceeds_gross = qty * bid
+    exec_price = apply_slippage(bid, "SELL", args)
+    proceeds_gross = qty * exec_price
     sell_fee = proceeds_gross * effective_fee_rate(args, "taker")
     proceeds_net = proceeds_gross - sell_fee
     cost_basis = safe_float(pos.get("cost_basis", 0.0), 0.0)
@@ -1015,14 +1054,14 @@ def sell_position(product: str, state: dict[str, Any], snap: dict[str, Any], arg
         "side": "SELL",
         "qty": qty8(qty),
         "market_price": usd(snap["price"]),
-        "exec_price": usd(bid),
+        "exec_price": usd(exec_price),
         "fee_usd": usd(sell_fee),
         "trade_cost_usd": usd(sell_fee),
         "total_trade_cost_usd": usd(total_trade_cost),
         "cash_after": usd(state["cash"]),
         "realized_pl_usd": usd(realized),
         "trade_score": round(snap["trade_score"], 2),
-        "reason": reason,
+        "reason": f"{reason} slippage_bps={safe_float(getattr(args, 'slippage_bps', 0.0), 0.0):.2f}",
     }
 
     term = "long" if holding_days > 365 else "short"
@@ -1045,7 +1084,7 @@ def sell_position(product: str, state: dict[str, Any], snap: dict[str, Any], arg
         "proceeds_usd": usd(proceeds_net),
         "gain_loss_usd": usd(realized),
         "buy_avg_price_usd": usd(pos.get("avg_price", 0.0)),
-        "sell_exec_price_usd": usd(bid),
+        "sell_exec_price_usd": usd(exec_price),
         "buy_fee_usd": usd(buy_fee),
         "sell_fee_usd": usd(sell_fee),
         "total_trade_cost_usd": usd(total_trade_cost),
@@ -1099,7 +1138,7 @@ def log_tax(tax_row: dict[str, Any]) -> None:
     append_csv(TAX_FILE, tax_row, header)
 
 
-def log_equity(state: dict[str, Any], snapshots: dict[str, dict[str, Any]], equity: float, fee_rate: float = 0.006) -> None:
+def log_equity(state: dict[str, Any], snapshots: dict[str, dict[str, Any]], equity: float, fee_rate: float = 0.006, slippage_bps: float = 0.0) -> None:
     unrealized = 0.0
     open_positions = []
     open_entry_fees_usd = 0.0
@@ -1112,7 +1151,7 @@ def log_equity(state: dict[str, Any], snapshots: dict[str, dict[str, Any]], equi
         if qty > 0 and product in snapshots:
             snap = snapshots[product]
             price = snap["price"]
-            acct = open_position_accounting(pos, snap, fee_rate)
+            acct = open_position_accounting(pos, snap, fee_rate, slippage_bps)
             u = acct["open_pl_after_entry_fee_usd"]
             unrealized += u
             open_entry_fees_usd += acct["entry_fee_usd"]
@@ -1385,7 +1424,7 @@ def run_cycle(state: dict[str, Any], products: list[str], args: argparse.Namespa
     print("\n" + "=" * 94)
     print(f"COINBASE PUBLIC-DATA PAPER BOT v13 - Local {local_now_iso()} | UTC {now_iso()}")
     print("=" * 94)
-    print(f"Fee model: {args.fee_model} | effective simulated taker fee: {fee_rate:.4%}")
+    print(f"Fee model: {args.fee_model} | effective simulated taker fee: {fee_rate:.4%} | slippage: {safe_float(getattr(args, 'slippage_bps', 0.0), 0.0):.2f} bps | missed-fill base: {normalize_rate(getattr(args, 'missed_fill_rate', 0.0)):.2%}")
     risk_line = f"Risk ladder: {risk['reason']} | trade size now ${adjusted_trade_size:,.2f} | buy score threshold {effective_threshold:.1f}"
     if risk.get("hard_halt") or str(risk.get("reason", "")).startswith("drawdown_ladder"):
         print(color_text(risk_line, "yellow", args))
@@ -1426,7 +1465,7 @@ def run_cycle(state: dict[str, Any], products: list[str], args: argparse.Namespa
                 if tax:
                     log_tax(tax)
         equity = calculate_equity(state, prices)
-        log_equity(state, snapshots, equity, effective_fee_rate(args, "taker"))
+        log_equity(state, snapshots, equity, effective_fee_rate(args, "taker"), safe_float(getattr(args, "slippage_bps", 0.0), 0.0))
         save_state(state)
         if args.exit_on_halt or state.get("absolute_stop_triggered"):
             raise SystemExit(3 if state.get("absolute_stop_triggered") else 2)
@@ -1445,13 +1484,17 @@ def run_cycle(state: dict[str, Any], products: list[str], args: argparse.Namespa
         if qty > 0:
             sell_now, reason = should_sell(pos, snap, args)
             if sell_now:
-                trade, tax = sell_position(product, state, snap, args, reason)
-                if trade:
-                    log_trade(trade)
-                    action = "SELL"
-                    action_reason = reason
-                if tax:
-                    log_tax(tax)
+                if paper_fill_missed(product, "SELL", snap, args):
+                    action = "HOLD_POSITION"
+                    action_reason = f"missed paper sell fill: {reason}"
+                else:
+                    trade, tax = sell_position(product, state, snap, args, reason)
+                    if trade:
+                        log_trade(trade)
+                        action = "SELL"
+                        action_reason = reason
+                    if tax:
+                        log_tax(tax)
             else:
                 action = "HOLD_POSITION"
                 action_reason = reason
@@ -1461,21 +1504,25 @@ def run_cycle(state: dict[str, Any], products: list[str], args: argparse.Namespa
                 action = "NO_BUY"
                 action_reason = skip_reason
             elif snap["trade_score"] >= effective_threshold:
-                trade = buy_position(product, state, snap, adjusted_trade_size, fee_rate)
-                if trade:
-                    log_trade(trade)
-                    action = "BUY"
-                    action_reason = f"score {snap['trade_score']:.1f} >= threshold {effective_threshold:.1f}"
-                else:
+                if paper_fill_missed(product, "BUY", snap, args):
                     action = "NO_BUY"
-                    action_reason = "insufficient cash, trade size too small, or already positioned"
+                    action_reason = f"missed paper buy fill at score {snap['trade_score']:.1f}"
+                else:
+                    trade = buy_position(product, state, snap, adjusted_trade_size, args, fee_rate)
+                    if trade:
+                        log_trade(trade)
+                        action = "BUY"
+                        action_reason = f"score {snap['trade_score']:.1f} >= threshold {effective_threshold:.1f}"
+                    else:
+                        action = "NO_BUY"
+                        action_reason = "insufficient cash, trade size too small, or already positioned"
             else:
                 action = "WATCH"
                 action_reason = f"score {snap['trade_score']:.1f} below threshold {effective_threshold:.1f}"
 
         pos_after = state["positions"][product]
         qty_after = safe_float(pos_after.get("qty", 0.0), 0.0)
-        acct = open_position_accounting(pos_after, snap, fee_rate) if qty_after > 0 else {}
+        acct = open_position_accounting(pos_after, snap, fee_rate, safe_float(getattr(args, "slippage_bps", 0.0), 0.0)) if qty_after > 0 else {}
         open_pl = acct.get("open_pl_after_entry_fee_usd", 0.0) if qty_after > 0 else 0.0
         net_pct = acct.get("net_liquidation_pct", 0.0) if qty_after > 0 else 0.0
 
@@ -1516,7 +1563,7 @@ def run_cycle(state: dict[str, Any], products: list[str], args: argparse.Namespa
             msg = f"TRADING HALTED: {reason}"
             alert_once(state, "alerted_temp_halt_reason", args, color="yellow", title="Trading halted", message=msg, popup=False)
 
-    log_equity(state, snapshots, equity, effective_fee_rate(args, "taker"))
+    log_equity(state, snapshots, equity, effective_fee_rate(args, "taker"), safe_float(getattr(args, "slippage_bps", 0.0), 0.0))
     save_state(state)
 
     daily_start = safe_float(state.get("daily_start_equity", equity), equity)
@@ -1630,15 +1677,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-drawdown-pct", type=float, default=0.10, help="Yellow hard halt if total account drawdown reaches this percentage. 0 disables percentage drawdown halt.")
     parser.add_argument("--absolute-stop-pct", type=float, default=0.25, help="Red final stop if account equity falls this percentage below starting cash. 0.25 or 25 = 25 percent. 0 disables.")
     parser.add_argument("--absolute-stop-value", type=float, default=0.0, help="Red final stop if account loses this many dollars from starting cash. 0 disables. If set with --absolute-stop-pct, whichever triggers first stops trading.")
-    parser.add_argument("--daily-profit-lock", type=float, default=0.0, help="If daily profit reaches this dollar amount, stop opening new trades for the rest of the UTC day. 0 disables.")
+    parser.add_argument("--daily-profit-lock", type=float, default=0.0, help="If daily profit reaches this dollar amount, stop opening new trades for the rest of the local computer day. 0 disables.")
     parser.add_argument("--idle-cash-apy", type=float, default=0.0, help="Simulated annual yield on idle paper cash. 0.04 = 4 percent APY. This is a paper assumption only.")
     parser.add_argument("--fee-model", choices=["conservative", "custom", "coinbase-advanced-maker", "coinbase-advanced-taker"], default="conservative", help="Fee preset used for simulated trades. The bot uses bid/ask execution, so taker/conservative is usually more realistic.")
     parser.add_argument("--fee-rate", type=float, default=0.006, help="Custom simulated fee rate, or conservative floor. 0.006 = 0.60 percent.")
     parser.add_argument("--maker-fee-rate", type=float, default=0.004, help="Simulated maker fee when --fee-model coinbase-advanced-maker is selected.")
     parser.add_argument("--taker-fee-rate", type=float, default=0.006, help="Simulated taker fee when --fee-model coinbase-advanced-taker is selected.")
+    parser.add_argument("--slippage-bps", type=float, default=5.0, help="Extra paper execution slippage in basis points. Buys pay ask plus slippage; sells receive bid minus slippage.")
+    parser.add_argument("--missed-fill-rate", type=float, default=0.02, help="Base probability that a normal paper trade signal does not fill. Spread and high volatility add to this. 0.02 = 2 percent.")
     parser.add_argument("--estimated-short-term-tax-rate", type=float, default=0.22, help="Estimated combined federal short-term tax rate before state. Accepts 0.22 or 22 for 22 percent.")
     parser.add_argument("--estimated-long-term-tax-rate", type=float, default=0.15, help="Estimated federal long-term capital gains tax rate before state. Accepts 0.15 or 15 for 15 percent.")
-    parser.add_argument("--estimated-state-tax-rate", type=float, default=0.0, help="Estimated state/local tax rate to add to federal estimate. Accepts 0.05 or 5 for 5 percent.")
+    parser.add_argument("--estimated-state-tax-rate", type=float, default=0.093, help="Estimated state/local tax rate to add to federal estimate. Default is a rough California estimate. Accepts 0.093 or 9.3 for 9.3 percent.")
     parser.add_argument("--assume-loss-tax-benefit", action="store_true", help="For losses, estimate tax savings in after-tax P/L. Conservative default is off: losses show no immediate tax benefit.")
     parser.add_argument("--granularity", type=int, default=60, choices=[60, 300, 900, 3600, 21600, 86400], help="Coinbase candle granularity in seconds.")
     parser.add_argument("--poll", type=int, default=60, help="Seconds between bot cycles in continuous mode.")

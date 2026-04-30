@@ -91,11 +91,18 @@ def analyze(log_dir: Path) -> int:
     total_pl = final_equity - start_equity
     total_pl_pct = return_pct(final_equity, start_equity)
     dd_usd, dd_pct = max_drawdown(equity_series)
+    returns = equity_series.pct_change().dropna()
+    returns = returns[returns.notna()]
+    if len(returns) >= 2 and float(returns.std()) > 0:
+        sharpe_like = float((returns.mean() / returns.std()) * (len(returns) ** 0.5))
+    else:
+        sharpe_like = 0.0
 
     print(f"Start equity:              {money(start_equity)}")
     print(f"Final equity:              {money(final_equity)}")
     print(f"Total P/L:                 {money(total_pl)} ({pct(total_pl_pct)})")
     print(f"Max drawdown:              {money(dd_usd)} ({pct(dd_pct)})")
+    print(f"Sharpe-like sample metric: {sharpe_like:.3f} ({len(returns)} equity return samples)")
 
     if "cash_yield_total" in equity:
         print(f"Idle cash yield total:     {money(float(as_float_series(equity, 'cash_yield_total').iloc[-1]))}")
@@ -146,13 +153,17 @@ def analyze(log_dir: Path) -> int:
         gross_wins = float(wins.sum()) if len(wins) else 0.0
         gross_losses = abs(float(losses.sum())) if len(losses) else 0.0
         profit_factor = (gross_wins / gross_losses) if gross_losses else float("inf")
+        expectancy = float(gains.mean()) if len(gains) else 0.0
+        avg_win = float(wins.mean()) if len(wins) else 0.0
+        avg_loss = float(losses.mean()) if len(losses) else 0.0
 
         print("\nClosed-trade stats")
         print("-" * 80)
         print(f"Closed trades:             {len(tax)}")
         print(f"Win rate:                  {pct(len(wins) / len(tax) * 100) if len(tax) else '0.00%'}")
-        print(f"Average win:               {money(float(wins.mean())) if len(wins) else '$0.00'}")
-        print(f"Average loss:              {money(float(losses.mean())) if len(losses) else '$0.00'}")
+        print(f"Average win:               {money(avg_win)}")
+        print(f"Average loss:              {money(avg_loss)}")
+        print(f"Expectancy/trade:          {money(expectancy)}")
         print(f"Profit factor:             {profit_factor:.3f}" if profit_factor != float("inf") else "Profit factor:             inf")
         print(f"Pre-tax closed P/L:        {money(total_gain)}")
         print(f"Estimated tax:             {money(total_tax)}")
@@ -160,6 +171,8 @@ def analyze(log_dir: Path) -> int:
         print(f"After-tax est. closed P/L: {money(total_after_tax)}")
         print(f"Best trade:                {money(float(gains.max()))}")
         print(f"Worst trade:               {money(float(gains.min()))}")
+        if len(tax) < 30:
+            print("Sample warning:            fewer than 30 closed trades; expectancy is not statistically stable.")
 
         if "asset" in tax:
             by_asset = tax.groupby("asset")["gain_loss_usd"].sum().sort_values(ascending=False)
@@ -169,6 +182,10 @@ def analyze(log_dir: Path) -> int:
             for asset, value in by_asset.items():
                 aft = float(by_asset_after.get(asset, value))
                 print(f"{asset:8s} pre-tax {money(float(value)):>12s}   after-tax est. {money(aft):>12s}")
+    else:
+        print("\nClosed-trade stats")
+        print("-" * 80)
+        print("No closed trades yet; win rate, average win/loss, and expectancy are unavailable.")
 
     if not daily.empty:
         print("\nLatest daily snapshots")

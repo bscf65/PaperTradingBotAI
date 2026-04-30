@@ -17,6 +17,7 @@ logs/
 *.log
 
 # Local downloads, archives, and extracted packages
+backups/
 downloads/
 zips/
 pkgs/archive/
