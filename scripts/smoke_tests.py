@@ -20,6 +20,7 @@ QUANTUM_BOT_PATH = ROOT / "bots/quantum-ai/quantum_ai_paper_bot_v2.py"
 QUANTUM_ANALYZER_PATH = ROOT / "bots/quantum-ai/analyze_quantum_ai_performance_v2.py"
 PRIVATE_BOT_PATH = ROOT / "bots/private-ai/private_ai_paper_bot_v4.py"
 PRIVATE_ANALYZER_PATH = ROOT / "bots/private-ai/analyze_private_ai_performance_v4.py"
+CONTROL_CENTER_PATH = ROOT / "control-center/app.py"
 
 
 def load_module(path: Path, name: str):
@@ -171,6 +172,18 @@ def test_history_evaluator_helpers() -> None:
         assert aggregate.exists()
 
 
+def test_control_center_app_imports() -> None:
+    control_center = load_module(CONTROL_CENTER_PATH, "control_center_smoke")
+    html = control_center.render_dashboard().decode("utf-8")
+    assert "InvestAI Control Center" in html
+    assert "Crypto" in html
+    assert "Account" in html
+    assert "Latest Scan" in html
+    assert "Backtest Category Summary" in html
+    assert "Alpha vs BTC" in html
+    assert control_center.safe_path(control_center.LOG_DIR, "../README_unified_project.md") is None
+
+
 def main() -> int:
     test_shell_syntax()
     test_paper_only_source()
@@ -179,6 +192,7 @@ def main() -> int:
     test_analyzer_minimal_logs()
     test_walk_forward_backtest()
     test_history_evaluator_helpers()
+    test_control_center_app_imports()
     print("Smoke tests passed.")
     return 0
 
