@@ -14,6 +14,12 @@ BOT_PATH = ROOT / "bots/crypto/btc_bot_v13_package/btc_eth_sol_coinbase_paper_bo
 ANALYZER_PATH = ROOT / "bots/crypto/btc_bot_v13_package/analyze_bot_performance_v13.py"
 BACKTEST_PATH = ROOT / "bots/crypto/btc_bot_v13_package/backtest_walk_forward_v13.py"
 EVALUATOR_PATH = ROOT / "bots/crypto/btc_bot_v13_package/evaluate_crypto_history_v13.py"
+OPTIONS_BOT_PATH = ROOT / "bots/options/options_etf_paper_bot_v4.py"
+OPTIONS_ANALYZER_PATH = ROOT / "bots/options/analyze_options_performance_v4.py"
+QUANTUM_BOT_PATH = ROOT / "bots/quantum-ai/quantum_ai_paper_bot_v2.py"
+QUANTUM_ANALYZER_PATH = ROOT / "bots/quantum-ai/analyze_quantum_ai_performance_v2.py"
+PRIVATE_BOT_PATH = ROOT / "bots/private-ai/private_ai_paper_bot_v4.py"
+PRIVATE_ANALYZER_PATH = ROOT / "bots/private-ai/analyze_private_ai_performance_v4.py"
 
 
 def load_module(path: Path, name: str):
@@ -31,7 +37,15 @@ def test_shell_syntax() -> None:
 
 
 def test_paper_only_source() -> None:
-    source = BOT_PATH.read_text(encoding="utf-8")
+    source = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in [
+            BOT_PATH,
+            OPTIONS_BOT_PATH,
+            QUANTUM_BOT_PATH,
+            PRIVATE_BOT_PATH,
+        ]
+    )
     banned = [
         "api_key",
         "api-secret",
@@ -53,6 +67,21 @@ def test_log_dir_env_override_and_config() -> None:
         assert config["estimated_state_tax_rate"] == 0.093
         assert config["slippage_bps"] > 0
         assert config["missed_fill_rate"] > 0
+
+
+def test_installed_bot_log_dir_overrides() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["INVESTAI_LOG_DIR"] = tmp
+        modules = [
+            load_module(OPTIONS_BOT_PATH, "options_bot_smoke"),
+            load_module(OPTIONS_ANALYZER_PATH, "options_analyzer_smoke"),
+            load_module(QUANTUM_BOT_PATH, "quantum_bot_smoke"),
+            load_module(QUANTUM_ANALYZER_PATH, "quantum_analyzer_smoke"),
+            load_module(PRIVATE_BOT_PATH, "private_bot_smoke"),
+            load_module(PRIVATE_ANALYZER_PATH, "private_analyzer_smoke"),
+        ]
+        for module in modules:
+            assert module.LOG_DIR == Path(tmp)
 
 
 def test_analyzer_minimal_logs() -> None:
@@ -144,6 +173,7 @@ def main() -> int:
     test_shell_syntax()
     test_paper_only_source()
     test_log_dir_env_override_and_config()
+    test_installed_bot_log_dir_overrides()
     test_analyzer_minimal_logs()
     test_walk_forward_backtest()
     test_history_evaluator_helpers()
