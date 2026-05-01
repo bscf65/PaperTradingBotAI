@@ -16,6 +16,10 @@ logs/
 **/logs/
 *.log
 
+# Generated research artifacts
+data/raw/
+reports/backtests/
+
 # Local downloads, archives, and extracted packages
 backups/
 downloads/

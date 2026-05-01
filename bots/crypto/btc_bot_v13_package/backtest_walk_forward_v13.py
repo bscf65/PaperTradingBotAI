@@ -301,16 +301,27 @@ def walk_forward(df: pd.DataFrame, args: argparse.Namespace, product: str) -> tu
         for spec, metrics in train_results:
             row = metrics.__dict__.copy()
             row["fold"] = fold
+            row["product"] = product
+            row["phase"] = "train"
+            row["variant"] = strategy_variant(spec)
             row["selected"] = spec == best_spec
             rows.append(row)
-        row = best_test.__dict__.copy()
-        row["fold"] = fold
-        row["selected"] = True
-        rows.append(row)
+
+        for spec, _train_metrics in train_results:
+            metrics = run_strategy(test, spec, args, f"fold_{fold}_test", product)
+            row = metrics.__dict__.copy()
+            row["fold"] = fold
+            row["product"] = product
+            row["phase"] = "test"
+            row["variant"] = strategy_variant(spec)
+            row["selected"] = spec == best_spec
+            rows.append(row)
         promotions.append(
             {
                 "fold": fold,
+                "product": product,
                 "strategy": best_spec.name,
+                "variant": strategy_variant(best_spec),
                 "train_passed": train_passed,
                 "test_passed": test_passed,
                 "train_after_tax_pl": best_train.after_tax_pl,
@@ -326,6 +337,39 @@ def walk_forward(df: pd.DataFrame, args: argparse.Namespace, product: str) -> tu
     if not rows:
         raise ValueError("not enough candles for one train/test fold")
     return pd.DataFrame(rows), pd.DataFrame(promotions)
+
+
+def strategy_variant(spec: StrategySpec) -> str:
+    return (
+        f"{spec.name}"
+        f"_thr{spec.threshold:g}"
+        f"_stop{spec.stop_atr:g}"
+        f"_tp{spec.take_profit_atr:g}"
+        f"_trail{spec.trailing_atr:g}"
+        f"_hold{spec.max_hold_bars}"
+    )
+
+
+def summarize_by_category(results: pd.DataFrame) -> pd.DataFrame:
+    test = results[results["phase"] == "test"].copy()
+    if test.empty:
+        return pd.DataFrame()
+    grouped = test.groupby("strategy", as_index=False).agg(
+        folds=("fold", "nunique"),
+        variants=("variant", "nunique"),
+        total_after_tax_pl=("after_tax_pl", "sum"),
+        mean_expectancy=("expectancy", "mean"),
+        mean_alpha_pct=("alpha_pct", "mean"),
+        mean_return_pct=("total_return_pct", "mean"),
+        worst_drawdown_pct=("max_drawdown_pct", "min"),
+        total_trades=("trades", "sum"),
+    )
+    grouped["decision_note"] = np.where(
+        (grouped["total_after_tax_pl"] > 0) & (grouped["mean_expectancy"] > 0) & (grouped["mean_alpha_pct"] >= 0),
+        "category_positive_out_of_sample",
+        "category_not_promoted",
+    )
+    return grouped.sort_values(["decision_note", "total_after_tax_pl"], ascending=[True, False])
 
 
 def main() -> int:
@@ -353,17 +397,25 @@ def main() -> int:
     stem = args.csv.stem
     results_path = args.out_dir / f"{stem}_walk_forward_results.csv"
     promotions_path = args.out_dir / f"{stem}_walk_forward_decisions.csv"
+    category_path = args.out_dir / f"{stem}_strategy_category_summary.csv"
+    category_summary = summarize_by_category(results)
     results.to_csv(results_path, index=False)
     promotions.to_csv(promotions_path, index=False)
+    category_summary.to_csv(category_path, index=False)
 
     print("\nWalk-forward backtest complete")
     print("=" * 80)
     print(f"Input candles:        {args.csv} ({len(df)} usable rows)")
     print(f"Results CSV:          {results_path}")
     print(f"Promotion decisions:  {promotions_path}")
+    print(f"Category summary:     {category_path}")
     print("\nPromotion summary")
     print("-" * 80)
     print(promotions.to_string(index=False))
+    if not category_summary.empty:
+        print("\nStrategy category out-of-sample summary")
+        print("-" * 80)
+        print(category_summary.to_string(index=False))
     accepted = int((promotions["decision"] == "candidate_for_promotion").sum())
     print(f"\nAccepted folds:       {accepted}/{len(promotions)}")
     print("Rule: promote only when train and out-of-sample test are positive after costs/taxes and alpha is non-negative.")

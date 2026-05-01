@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BOT_PATH = ROOT / "bots/crypto/btc_bot_v13_package/btc_eth_sol_coinbase_paper_bot_v13.py"
 ANALYZER_PATH = ROOT / "bots/crypto/btc_bot_v13_package/analyze_bot_performance_v13.py"
 BACKTEST_PATH = ROOT / "bots/crypto/btc_bot_v13_package/backtest_walk_forward_v13.py"
+EVALUATOR_PATH = ROOT / "bots/crypto/btc_bot_v13_package/evaluate_crypto_history_v13.py"
 
 
 def load_module(path: Path, name: str):
@@ -104,9 +105,39 @@ def test_walk_forward_backtest() -> None:
             min_train_trades=0,
         )
         results, promotions = backtest.walk_forward(df, args, "BTC-USD")
+        summary = backtest.summarize_by_category(results)
         assert not results.empty
         assert not promotions.empty
+        assert not summary.empty
+        assert set(results["phase"]) == {"train", "test"}
+        assert {"momentum", "mean_reversion", "breakout"}.issubset(set(results["strategy"]))
         assert "decision" in promotions.columns
+
+
+def test_history_evaluator_helpers() -> None:
+    evaluator = load_module(EVALUATOR_PATH, "history_evaluator_smoke")
+    assert evaluator.parse_products("btc-usd, eth-usd") == ["BTC-USD", "ETH-USD"]
+    with tempfile.TemporaryDirectory() as tmp:
+        out_dir = Path(tmp)
+        pd = __import__("pandas")
+        pd.DataFrame(
+            [
+                {
+                    "strategy": "momentum",
+                    "folds": 1,
+                    "variants": 1,
+                    "total_after_tax_pl": 1.0,
+                    "mean_expectancy": 1.0,
+                    "mean_alpha_pct": 0.1,
+                    "mean_return_pct": 0.1,
+                    "worst_drawdown_pct": 0.0,
+                    "total_trades": 1,
+                    "decision_note": "category_positive_out_of_sample",
+                }
+            ]
+        ).to_csv(out_dir / "BTC-USD_3600s_test_strategy_category_summary.csv", index=False)
+        aggregate = evaluator.aggregate_category_summaries(out_dir)
+        assert aggregate.exists()
 
 
 def main() -> int:
@@ -115,6 +146,7 @@ def main() -> int:
     test_log_dir_env_override_and_config()
     test_analyzer_minimal_logs()
     test_walk_forward_backtest()
+    test_history_evaluator_helpers()
     print("Smoke tests passed.")
     return 0
 
