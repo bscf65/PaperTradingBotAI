@@ -153,6 +153,7 @@ def test_history_evaluator_helpers() -> None:
         pd.DataFrame(
             [
                 {
+                    "product": "BTC-USD",
                     "strategy": "momentum",
                     "folds": 1,
                     "variants": 1,

@@ -134,7 +134,8 @@ def aggregate_category_summaries(out_dir: Path) -> Path:
         if df.empty:
             continue
         product = path.name.split("_", 1)[0]
-        df.insert(0, "product", product)
+        if "product" not in df.columns:
+            df.insert(0, "product", product)
         summaries.append(df)
     aggregate_path = out_dir / "ALL_PRODUCTS_strategy_category_summary.csv"
     if summaries:
