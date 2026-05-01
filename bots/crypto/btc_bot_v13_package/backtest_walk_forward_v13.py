@@ -114,6 +114,10 @@ class Metrics:
     avg_loss: float
     expectancy: float
     after_tax_pl: float
+    fee_rate: float
+    slippage_bps: float
+    synthetic_spread_pct: float
+    missed_fill_rate: float
 
 
 def missed_fill(product: str, side: str, timestamp: pd.Timestamp, price: float, base_rate: float, spread_pct: float) -> bool:
@@ -127,6 +131,8 @@ def missed_fill(product: str, side: str, timestamp: pd.Timestamp, price: float, 
 
 def signal_for(row: pd.Series, spec: StrategySpec) -> tuple[bool, str]:
     close = float(row["Close"])
+    if spec.name == "buy_hold":
+        return True, "buy_hold_entry"
     if spec.name == "momentum":
         score = 0.0
         score += 30 if close > float(row["EMA50"]) and float(row["EMA20"]) > float(row["EMA50"]) else 0
@@ -143,6 +149,12 @@ def signal_for(row: pd.Series, spec: StrategySpec) -> tuple[bool, str]:
         vol_ok = float(row["Volume"]) >= float(row["VOL_MA20"]) * 1.05
         breakout = close > float(row["HIGH_30_PREV"]) * (1 + spec.threshold)
         return bool(vol_ok and breakout), "breakout_30_high"
+    if spec.name == "volatility_filter":
+        atr_pct = float(row["ATR14"]) / close if close else 0.0
+        trend_ok = close > float(row["EMA50"])
+        rsi_ok = 40 <= float(row["RSI14"]) <= 70
+        vol_ok = 0.0015 <= atr_pct <= spec.threshold
+        return bool(trend_ok and rsi_ok and vol_ok), f"atr_pct={atr_pct:.4f}"
     raise ValueError(f"unknown strategy: {spec.name}")
 
 
@@ -195,10 +207,13 @@ def run_strategy(df: pd.DataFrame, spec: StrategySpec, args: argparse.Namespace,
         if qty > 0:
             highest = max(highest, close)
             sell_reason = (
-                close <= entry_price - spec.stop_atr * atr
-                or close >= entry_price + spec.take_profit_atr * atr
-                or close <= highest - spec.trailing_atr * atr
-                or (i - entry_bar) >= spec.max_hold_bars
+                spec.name != "buy_hold"
+                and (
+                    close <= entry_price - spec.stop_atr * atr
+                    or close >= entry_price + spec.take_profit_atr * atr
+                    or close <= highest - spec.trailing_atr * atr
+                    or (i - entry_bar) >= spec.max_hold_bars
+                )
             )
             if sell_reason and not missed_fill(product, "SELL", row["time"], close, args.missed_fill_rate, spread):
                 exec_price = bid * (1 - slip)
@@ -262,17 +277,23 @@ def run_strategy(df: pd.DataFrame, spec: StrategySpec, args: argparse.Namespace,
         avg_loss=float(losses.mean()) if len(losses) else 0.0,
         expectancy=float(gains.mean()) if len(gains) else 0.0,
         after_tax_pl=float(sum(realized_after_tax)),
+        fee_rate=fee_rate,
+        slippage_bps=float(args.slippage_bps),
+        synthetic_spread_pct=spread,
+        missed_fill_rate=normalize_rate(args.missed_fill_rate),
     )
 
 
 def candidates() -> list[StrategySpec]:
     return [
+        StrategySpec("buy_hold", 0.0, 0.0, 0.0, 0.0, 10_000),
         StrategySpec("momentum", 50, 2.0, 4.0, 2.5, 80),
         StrategySpec("momentum", 65, 2.0, 5.0, 3.0, 100),
         StrategySpec("mean_reversion", 38, 1.8, 2.5, 2.0, 60),
         StrategySpec("mean_reversion", 32, 2.2, 3.0, 2.5, 90),
         StrategySpec("breakout", 0.000, 2.2, 4.5, 3.0, 100),
         StrategySpec("breakout", 0.003, 2.5, 5.0, 3.2, 120),
+        StrategySpec("volatility_filter", 0.012, 2.0, 4.0, 2.5, 90),
     ]
 
 

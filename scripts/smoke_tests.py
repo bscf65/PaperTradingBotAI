@@ -139,7 +139,8 @@ def test_walk_forward_backtest() -> None:
         assert not promotions.empty
         assert not summary.empty
         assert set(results["phase"]) == {"train", "test"}
-        assert {"momentum", "mean_reversion", "breakout"}.issubset(set(results["strategy"]))
+        assert {"buy_hold", "momentum", "mean_reversion", "breakout", "volatility_filter"}.issubset(set(results["strategy"]))
+        assert {"fee_rate", "slippage_bps", "synthetic_spread_pct", "missed_fill_rate"}.issubset(results.columns)
         assert "decision" in promotions.columns
 
 
